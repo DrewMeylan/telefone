@@ -1,138 +1,164 @@
 package snmp
 
 import (
+	"errors"
+	"flag"
 	"fmt"
-	"time"
+	"log"
 	"net"
+	"os"
+	"strings"
 	"sync"
+	"time"
 
+	"github.com/go-ping/ping"
 	"github.com/gosnmp/gosnmp"
 )
 
-// should Scan() methods produce JUST ip addresses or full target path
-
-type snmpScanner struct {
-	// This is essentially just a port scanner; search subnet for devices listening on 161
-	Subnet  					*net.IPNet
-	Port 							uint16
-	Timeout 					time.Duration
-	ConcurrentScans		int
-	Results           []string	
-}
-
-func (s *snmpScanner) Scan(net.IPNet) ([]net.IP, error) {
-	
-	// We should add logic in to pingsweep the IP Subnet first so we can perform the port scan only on active hosts.
-	// This will save a little time on the port scanner itself but substantial time on scanners with retries, timeouts, etc.
-
-	var wg snc.WaitGroup // Review Waitgroup
-	ipChan := make(chan string, s.ConcurrentScans) // Review
-	s.Results = make(map[string]map[string]string) //Review
-	mutex := sync.Mutex{} //Review
-
-	for i := 0; i < s.ConcurrentScans; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for ip := range ipChan {
-				results := s.queryHost(ip) // This is a METHOD; we need to define this method within the context of snmpScanner
-				if results != nil {
-					mutex.Lock()
-					s.Results[ip] = results
-					mutex.Unlock()
-				}
-			}
-		}()
-	}
-	for ip := range hosts(s.Subnet) {
-		ipChan <- ip
-	}
-	close(ipChan)
-	wg.Wait()
-	return nil // This almost certainly is not correct. Needs to return []net.IP, err
-}
-
+// oidScanner holds configuration for scanning a subnet via SNMP.
 type oidScanner struct {
-	// Search subnet for devices containing a specific set of OIDs
-	Subnet          *net.IPNet   // The subnet to scan (e.g., 192.168.1.0/24)
-	Community       string       // SNMP community string (e.g., "public")
-	Version         string       // SNMP version (e.g., "2c")
-	OIDs            []string     // List of OIDs to scan for
-	Timeout         time.Duration // Timeout per request
-	Retries         int           // Number of retries for each request
-	Port            uint16        // SNMP port (default 161)
-	ConcurrentScans int           // Number of concurrent workers for scanning
-	Results         map[string]map[string]string // Results[IP][OID] = value
-	Verbose         bool          // Enable detailed logging/debugging
+	Subnet      *net.IPNet
+	Version     string
+	Community   string
+	OID         string
+	Concurrency int
+	Timeout     time.Duration
 }
 
-func (s *oidScanner) Scan(net.IPNet) ([]net.IP, error) {
-	// MODIFY return more than just an error
+// Scan performs the subnet scan, checking each IP for the presence of the given OID.
+func (s *oidScanner) Scan() ([]net.IP, error) {
+	var responsiveIPs []net.IP
 	var wg sync.WaitGroup
-	ipChan := make(chan string, s.ConcurrentScans)
-	s.Results = make(map[string]map[string]string)
-	mutex := sync.Mutex{}
+	var mu sync.Mutex
 
-	// Start worker goroutines
-	for i := 0; i < s.ConcurrentScans; i++ {
+	ips := helpers.enumerateIPs(s.Subnet)
+
+	// Step 1 & 2: Ping sweep with port check
+	pingJobs := make(chan net.IP, len(ips))
+	for i := 0; i < s.Concurrency; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for ip := range ipChan {
-				results := s.queryHost(ip)
-				if results != nil {
-					mutex.Lock()
-					s.Results[ip] = results
-					mutex.Unlock()
+			for ip := range pingJobs {
+				if helpers.isHostUp(ip, s.Timeout) && helpers.isPortOpen(ip, 161, s.Timeout) {
+					mu.Lock()
+					responsiveIPs = append(responsiveIPs, ip)
+					mu.Unlock()
 				}
 			}
 		}()
 	}
-
-	// Enqueue IPs
-	for ip := range hosts(s.Subnet) {
-		ipChan <- ip
+	for _, ip := range ips {
+		pingJobs <- ip
 	}
-	close(ipChan)
+	close(pingJobs)
 	wg.Wait()
-	return nil // This does not appear to be correct? 
+
+	// Step 3 - 5: SNMP check for OID presence
+	var matchedIPs []net.IP
+	jobs := make(chan net.IP, len(responsiveIPs))
+	wg = sync.WaitGroup{}
+	mu = sync.Mutex{}
+
+	for i := 0; i < s.Concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for ip := range jobs {
+				if s.checkOID(ip) {
+					mu.Lock()
+					matchedIPs = append(matchedIPs, ip)
+					mu.Unlock()
+				}
+			}
+		}()
+	}
+	for _, ip := range responsiveIPs {
+		jobs <- ip
+	}
+	close(jobs)
+	wg.Wait()
+
+	return matchedIPs, nil
 }
 
-func (s *oidScanner) queryHost(ip string) map[string]string {
+// checkOID queries the OID on the given IP using the provided SNMP version and community string.
+func (s *oidScanner) checkOID(ip net.IP) bool {
 	params := &gosnmp.GoSNMP{
-		Target:    ip,
-		Port:      s.Port,
+		Target:    ip.String(),
+		Port:      161,
 		Community: s.Community,
-		Version:   gosnmp.Version2c,
+		Version:   getSNMPVersion(s.Version),
 		Timeout:   s.Timeout,
-		Retries:   s.Retries,
+		Retries:   1,
 	}
-
-	if err := params.Connect(); err != nil {
-		if s.Verbose {
-			fmt.Printf("[!] Failed to connect to %s: %v\n", ip, err)
-		}
-		return nil
+	err := params.Connect()
+	if err != nil {
+		return false
 	}
 	defer params.Conn.Close()
 
-	result, err := params.Get(s.OIDs)
-	if err != nil {
-		if s.Verbose {
-			fmt.Printf("[!] SNMP GET failed for %s: %v\n", ip, err)
-		}
-		return nil
+	result, err := params.Get([]string{s.OID})
+	if err != nil || len(result.Variables) == 0 {
+		return false
+	}
+	return true
+}
+
+// getSNMPVersion returns the gosnmp SNMP version enum from string.
+func getSNMPVersion(ver string) gosnmp.SnmpVersion {
+	switch strings.ToLower(ver) {
+	case "1":
+		return gosnmp.Version1
+	case "3":
+		// SNMPv3 not implemented in this version
+		log.Fatal("SNMPv3 not supported in this implementation")
+		return gosnmp.Version3
+	default:
+		return gosnmp.Version2c
+	}
+}
+
+func main() {
+	var subnetStr, version, community, oid string
+	var concurrency int
+	var timeout time.Duration
+
+	flag.StringVar(&subnetStr, "subnet", "", "IP subnet in CIDR notation (e.g., 192.168.1.0/24)")
+	flag.StringVar(&version, "version", "2c", "SNMP version: 1, 2c, or 3")
+	flag.StringVar(&community, "community", "public", "SNMPv2 community string")
+	flag.StringVar(&oid, "oid", "", "OID to search for")
+	flag.IntVar(&concurrency, "concurrency", 50, "Number of concurrent workers")
+	flag.DurationVar(&timeout, "timeout", 2*time.Second, "Timeout for ping/SNMP operations")
+	flag.Parse()
+
+	if subnetStr == "" || oid == "" {
+		fmt.Println("Usage: go run main.go -subnet=<cidr> -version=2c -community=public -oid=<oid>")
+		os.Exit(1)
 	}
 
-	response := make(map[string]string)
-	for _, variable := range result.Variables {
-		oid := variable.Name
-		value := fmt.Sprintf("%v", variable.Value)
-		response[oid] = value
-		if s.Verbose {
-			fmt.Printf("[+] %s - %s: %s\n", ip, oid, value)
-		}
+	subnet, err := helpers.parseCIDR(subnetStr)
+	if err != nil {
+		log.Fatalf("Invalid subnet: %v", err)
 	}
-	return response
+
+	scanner := &oidScanner{
+		Subnet:      subnet,
+		Version:     version,
+		Community:   community,
+		OID:         oid,
+		Concurrency: concurrency,
+		Timeout:     timeout,
+	}
+
+	results, err := scanner.Scan()
+	if err != nil {
+		log.Fatalf("Scan failed: %v", err)
+	}
+
+	fmt.Println("Matching IPs:")
+	for _, ip := range results {
+		fmt.Println(ip)
+	}
 }
 
