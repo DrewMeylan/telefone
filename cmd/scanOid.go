@@ -1,4 +1,6 @@
 /*
+
+
 Copyright © 2025 NAME HERE <EMAIL ADDRESS>
 
 */
@@ -6,46 +8,44 @@ package cmd
 
 import (
 	"fmt"
-
+	"net"
+	"github.com/drewmeylan/telefone/internals"
 	"github.com/spf13/cobra"
+)
+
+var (
+	network  string
+	oid 		 string
+	community string
+	version string
 )
 
 // scanOidCmd represents the scanOid command
 var scanOidCmd = &cobra.Command{
 	Use:   "scanOid",
-	Short: "A brief description of your command",
-	Long: `A longer description that spans multiple lines and likely contains examples
-and usage of using your command. For example:
-
-Cobra is a CLI library for Go that empowers applications.
-This application is a tool to generate the needed files
-to quickly create a Cobra application.`,
+	Short: "Scan devices in a subnet for a specific OID",
+	Long: ``,
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Println("scanOid called")
+		fmt.Println("network: ", network)	
+		fmt.Println("oid", oid)
+		fmt.Println("community", community)
+		fmt.Println("version", version)
 
+		ip_range := helpers.EnumerateHosts(net.IPNet(network))
+		fmt.Println(ip_range)
 	},
 }
 
 func init() {
 	rootCmd.AddCommand(scanOidCmd)
 
-	// Here you will define your flags and configuration settings.
-
-	// Cobra supports Persistent Flags which will work for this command
-	// and all subcommands, e.g.:
-	// scanOidCmd.PersistentFlags().String("foo", "", "A help for foo")
-
-	// Cobra supports local flags which will only run when this command
-	// is called directly, e.g.:
-	
-	scanOidCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
-	scanOidCmd.Flags().StringVarP("version", "v",  "version") 
-	scanOidCmd.Flags().StringVarP("oid", "o", "", "OID to search for") 
-	scanOidCmd.Flags().StringVarP("comunity", "c", "", "Community string")
-	scanOidCmd.Flags().StringVarP("network", "n", "", "Network to scan (CIDR)")
-	
-	scanOidCmd.MarkFlagsRequired("version")
-	scanOidCmd.MarkFlagsRequired("oid")
-	scanOidCmd.MarkFlagsRequired("community")
-	scanOidCmd.MarkFlagsRequired("network")
+	scanOidCmd.Flags().StringVarP(&version, "version", "v", "", "SNMP version")
+	scanOidCmd.Flags().StringVarP(&oid, "oid", "o", "", "OID to search for")
+	scanOidCmd.Flags().StringVarP(&community, "community", "c", "", "Community string")
+	scanOidCmd.Flags().StringVarP(&network, "network", "n", "", "Network to scan (CIDR)")
+		
+	scanOidCmd.MarkFlagRequired("version")
+	scanOidCmd.MarkFlagRequired("oid")
+	scanOidCmd.MarkFlagRequired("community")
+	scanOidCmd.MarkFlagRequired("network")
 }

@@ -1,4 +1,4 @@
-package common
+package internals
 
 import (
 	"fmt"
